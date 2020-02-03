@@ -1,0 +1,15 @@
+[package]
+name = "protocol-serde"
+version = "0.1.0"
+authors = ["Izzy Swart <zenerboson@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+protocol = { git = "https://github.com/noocene/protocol" }
+serde = { version = "1.0.104", default-features = false }
+futures = { version = "0.3.1", default-features = false }
+
+[features]
+alloc = ["serde/alloc"]
+std = []
+default = ["std", "alloc"]
