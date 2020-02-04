@@ -51,19 +51,21 @@ pub trait Serializer<T: Serialize + DeserializeOwned> {
 }
 
 pub trait ByteSerializer<T: Serialize + DeserializeOwned>: Serializer<T> {
+    type Serialize: Future<Output = Result<(), <Self as ByteSerializer<T>>::SerializeError>>;
     type SerializeError;
+    type Deserialize: Future<Output = Result<T, <Self as ByteSerializer<T>>::DeserializeError>>;
     type DeserializeError;
 
     fn serialize<W: AsyncWrite>(
         &mut self,
         writer: &mut W,
         item: T,
-    ) -> Result<(), <Self as ByteSerializer<T>>::SerializeError>;
+    ) -> <Self as ByteSerializer<T>>::Serialize;
 
     fn deserialize<R: AsyncRead>(
         &mut self,
         reader: &mut R,
-    ) -> Result<T, <Self as ByteSerializer<T>>::DeserializeError>;
+    ) -> <Self as ByteSerializer<T>>::Deserialize;
 }
 
 pub struct Serde<T>(T);
@@ -88,16 +90,16 @@ impl<T: Serializer<U>, U: Serialize + DeserializeOwned> ItemFormat<U> for Serde<
 
 impl<T: ByteSerializer<U>, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde<T> {
     type SerializeError = <T as ByteSerializer<U>>::SerializeError;
-    type Serialize = Ready<Result<(), <T as ByteSerializer<U>>::SerializeError>>;
+    type Serialize = <T as ByteSerializer<U>>::Serialize;
     type DeserializeError = <T as ByteSerializer<U>>::DeserializeError;
-    type Deserialize = Ready<Result<U, <T as ByteSerializer<U>>::DeserializeError>>;
+    type Deserialize = <T as ByteSerializer<U>>::Deserialize;
 
     fn serialize<W: AsyncWrite>(&mut self, writer: &mut W, item: U) -> Self::Serialize {
-        ready(ByteSerializer::serialize(&mut self.0, writer, item))
+        ByteSerializer::serialize(&mut self.0, writer, item)
     }
 
     fn deserialize<R: AsyncRead>(&mut self, reader: &mut R) -> Self::Deserialize {
-        ready(ByteSerializer::deserialize(&mut self.0, reader))
+        ByteSerializer::deserialize(&mut self.0, reader)
     }
 }
 
