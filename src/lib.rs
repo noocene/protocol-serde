@@ -14,12 +14,16 @@ use core::{
     },
     time::Duration,
 };
+use core_futures_io::{AsyncRead, AsyncWrite};
 use futures::{
     future::{ready, Map, Ready},
     stream::{once, Forward, Once, StreamFuture},
     FutureExt, Sink, StreamExt,
 };
-use protocol::{Bottom, Channels, Format, Protocol};
+use protocol::{
+    format::{ByteFormat, ItemFormat},
+    Bottom, Channels, Format, Protocol,
+};
 use serde::{de::DeserializeOwned, Serialize};
 
 #[macro_export]
@@ -49,9 +53,27 @@ pub trait Serializer {
     ) -> Result<T, Self::DeserializeError>;
 }
 
+pub trait ByteSerializer: Serializer {
+    type SerializeError;
+    type DeserializeError;
+
+    fn serialize<T: Serialize + DeserializeOwned, W: AsyncWrite>(
+        &mut self,
+        writer: &mut W,
+        item: T,
+    ) -> Result<(), <Self as ByteSerializer>::SerializeError>;
+
+    fn deserialize<T: Serialize + DeserializeOwned, R: AsyncRead>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<T, <Self as ByteSerializer>::DeserializeError>;
+}
+
 pub struct Serde<T: Serializer>(T);
 
-impl<T: Serializer, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {
+impl<T: Serializer, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {}
+
+impl<T: Serializer, U: Serialize + DeserializeOwned> ItemFormat<U> for Serde<T> {
     type Representation = T::Representation;
     type SerializeError = T::SerializeError;
     type Serialize = Ready<Result<T::Representation, T::SerializeError>>;
@@ -64,6 +86,21 @@ impl<T: Serializer, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {
 
     fn deserialize(&mut self, item: T::Representation) -> Self::Deserialize {
         ready(self.0.deserialize(item))
+    }
+}
+
+impl<T: ByteSerializer, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde<T> {
+    type SerializeError = <T as ByteSerializer>::SerializeError;
+    type Serialize = Ready<Result<(), <T as ByteSerializer>::SerializeError>>;
+    type DeserializeError = <T as ByteSerializer>::DeserializeError;
+    type Deserialize = Ready<Result<U, <T as ByteSerializer>::DeserializeError>>;
+
+    fn serialize<W: AsyncWrite>(&mut self, writer: &mut W, item: U) -> Self::Serialize {
+        ready(ByteSerializer::serialize(&mut self.0, writer, item))
+    }
+
+    fn deserialize<R: AsyncRead>(&mut self, reader: &mut R) -> Self::Deserialize {
+        ready(ByteSerializer::deserialize(&mut self.0, reader))
     }
 }
 
