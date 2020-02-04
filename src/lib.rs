@@ -4,6 +4,7 @@
 extern crate alloc;
 
 use core::{
+    future::Future,
     num::{
         NonZeroI128, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU128,
         NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize,
@@ -37,63 +38,59 @@ macro_rules! Serde {
 #[derive(Debug)]
 pub struct Insufficient;
 
-pub trait Serializer {
+pub trait Serializer<T: Serialize + DeserializeOwned> {
+    type Serialize: Future<Output = Result<Self::Representation, Self::SerializeError>>;
     type SerializeError;
+    type Deserialize: Future<Output = Result<T, Self::DeserializeError>>;
     type DeserializeError;
     type Representation;
 
-    fn serialize<T: Serialize + DeserializeOwned>(
-        &mut self,
-        item: T,
-    ) -> Result<Self::Representation, Self::SerializeError>;
+    fn serialize(&mut self, item: T) -> Self::Serialize;
 
-    fn deserialize<T: Serialize + DeserializeOwned>(
-        &mut self,
-        item: Self::Representation,
-    ) -> Result<T, Self::DeserializeError>;
+    fn deserialize(&mut self, item: Self::Representation) -> Self::Deserialize;
 }
 
-pub trait ByteSerializer: Serializer {
+pub trait ByteSerializer<T: Serialize + DeserializeOwned>: Serializer<T> {
     type SerializeError;
     type DeserializeError;
 
-    fn serialize<T: Serialize + DeserializeOwned, W: AsyncWrite>(
+    fn serialize<W: AsyncWrite>(
         &mut self,
         writer: &mut W,
         item: T,
-    ) -> Result<(), <Self as ByteSerializer>::SerializeError>;
+    ) -> Result<(), <Self as ByteSerializer<T>>::SerializeError>;
 
-    fn deserialize<T: Serialize + DeserializeOwned, R: AsyncRead>(
+    fn deserialize<R: AsyncRead>(
         &mut self,
         reader: &mut R,
-    ) -> Result<T, <Self as ByteSerializer>::DeserializeError>;
+    ) -> Result<T, <Self as ByteSerializer<T>>::DeserializeError>;
 }
 
-pub struct Serde<T: Serializer>(T);
+pub struct Serde<T>(T);
 
-impl<T: Serializer, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {}
+impl<T: Serializer<U>, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {}
 
-impl<T: Serializer, U: Serialize + DeserializeOwned> ItemFormat<U> for Serde<T> {
+impl<T: Serializer<U>, U: Serialize + DeserializeOwned> ItemFormat<U> for Serde<T> {
     type Representation = T::Representation;
     type SerializeError = T::SerializeError;
-    type Serialize = Ready<Result<T::Representation, T::SerializeError>>;
+    type Serialize = T::Serialize;
     type DeserializeError = T::DeserializeError;
-    type Deserialize = Ready<Result<U, T::DeserializeError>>;
+    type Deserialize = T::Deserialize;
 
     fn serialize(&mut self, item: U) -> Self::Serialize {
-        ready(self.0.serialize(item))
+        self.0.serialize(item)
     }
 
     fn deserialize(&mut self, item: T::Representation) -> Self::Deserialize {
-        ready(self.0.deserialize(item))
+        self.0.deserialize(item)
     }
 }
 
-impl<T: ByteSerializer, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde<T> {
-    type SerializeError = <T as ByteSerializer>::SerializeError;
-    type Serialize = Ready<Result<(), <T as ByteSerializer>::SerializeError>>;
-    type DeserializeError = <T as ByteSerializer>::DeserializeError;
-    type Deserialize = Ready<Result<U, <T as ByteSerializer>::DeserializeError>>;
+impl<T: ByteSerializer<U>, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde<T> {
+    type SerializeError = <T as ByteSerializer<U>>::SerializeError;
+    type Serialize = Ready<Result<(), <T as ByteSerializer<U>>::SerializeError>>;
+    type DeserializeError = <T as ByteSerializer<U>>::DeserializeError;
+    type Deserialize = Ready<Result<U, <T as ByteSerializer<U>>::DeserializeError>>;
 
     fn serialize<W: AsyncWrite>(&mut self, writer: &mut W, item: U) -> Self::Serialize {
         ready(ByteSerializer::serialize(&mut self.0, writer, item))
@@ -123,7 +120,7 @@ impl<T: ByteSerializer, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde
 macro_rules! flat {
     ( $( $x:ty ),* ) => {
         $(
-            impl<T: Serializer, C: Channels<$x, Bottom>> Protocol<Serde<T>, C> for $x
+            impl<T, C: Channels<$x, Bottom>> Protocol<Serde<T>, C> for $x
             where
                 C::Unravel: Unpin,
                 C::Coalesce: Unpin
