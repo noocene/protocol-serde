@@ -4,27 +4,26 @@
 extern crate alloc;
 
 use core::{
-    future::Future,
+    marker::PhantomData,
     num::{
         NonZeroI128, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU128,
         NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize,
     },
+    pin::Pin,
     sync::atomic::{
         AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicIsize, AtomicU16, AtomicU32,
         AtomicU64, AtomicU8, AtomicUsize,
     },
+    task::{Context, Poll},
     time::Duration,
 };
-use core_futures_io::{AsyncRead, AsyncWrite};
 use futures::{
     future::{ready, Map, Ready},
-    stream::{once, Forward, Once, StreamFuture},
-    FutureExt, Sink, StreamExt,
+    ready,
+    stream::{once, Forward, IntoStream, Once, StreamFuture},
+    FutureExt, Sink, Stream, StreamExt, TryStream, TryStreamExt,
 };
-use protocol::{
-    format::{ByteFormat, ItemFormat},
-    Bottom, Channels, Format, Protocol,
-};
+use protocol::{format::ItemFormat, Bottom, Channels, Format, Protocol};
 use serde::{de::DeserializeOwned, Serialize};
 
 #[macro_export]
@@ -36,70 +35,119 @@ macro_rules! Serde {
 }
 
 #[derive(Debug)]
-pub struct Insufficient;
+pub enum SerdeError<T> {
+    Insufficient,
+    Stream(T),
+}
 
 pub trait Serializer<T: Serialize + DeserializeOwned> {
-    type Serialize: Future<Output = Result<Self::Representation, Self::SerializeError>>;
     type SerializeError;
-    type Deserialize: Future<Output = Result<T, Self::DeserializeError>>;
     type DeserializeError;
     type Representation;
 
-    fn serialize(&mut self, item: T) -> Self::Serialize;
+    fn serialize(&mut self, item: T) -> Result<Self::Representation, Self::SerializeError>;
 
-    fn deserialize(&mut self, item: Self::Representation) -> Self::Deserialize;
-}
-
-pub trait ByteSerializer<T: Serialize + DeserializeOwned>: Serializer<T> {
-    type Serialize: Future<Output = Result<(), <Self as ByteSerializer<T>>::SerializeError>>;
-    type SerializeError;
-    type Deserialize: Future<Output = Result<T, <Self as ByteSerializer<T>>::DeserializeError>>;
-    type DeserializeError;
-
-    fn serialize<W: AsyncWrite>(
-        &mut self,
-        writer: &mut W,
-        item: T,
-    ) -> <Self as ByteSerializer<T>>::Serialize;
-
-    fn deserialize<R: AsyncRead>(
-        &mut self,
-        reader: &mut R,
-    ) -> <Self as ByteSerializer<T>>::Deserialize;
+    fn deserialize(&mut self, item: Self::Representation) -> Result<T, Self::DeserializeError>;
 }
 
 pub struct Serde<T>(T);
 
-impl<T: Serializer<U>, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {}
-
-impl<T: Serializer<U>, U: Serialize + DeserializeOwned> ItemFormat<U> for Serde<T> {
-    type Representation = T::Representation;
-    type SerializeError = T::SerializeError;
-    type Serialize = T::Serialize;
-    type DeserializeError = T::DeserializeError;
-    type Deserialize = T::Deserialize;
-
-    fn serialize(&mut self, item: U) -> Self::Serialize {
-        self.0.serialize(item)
-    }
-
-    fn deserialize(&mut self, item: T::Representation) -> Self::Deserialize {
-        self.0.deserialize(item)
+impl<T> Serde<T> {
+    pub fn new(serializer: T) -> Self {
+        Serde(serializer)
     }
 }
 
-impl<T: ByteSerializer<U>, U: Serialize + DeserializeOwned> ByteFormat<U> for Serde<T> {
-    type SerializeError = <T as ByteSerializer<U>>::SerializeError;
-    type Serialize = <T as ByteSerializer<U>>::Serialize;
-    type DeserializeError = <T as ByteSerializer<U>>::DeserializeError;
-    type Deserialize = <T as ByteSerializer<U>>::Deserialize;
+pub struct SerdeOutput<
+    U: Serialize + DeserializeOwned,
+    T: Serializer<U>,
+    S: Sink<T::Representation> + TryStream<Ok = T::Representation>,
+> {
+    serializer: T,
+    channel: IntoStream<S>,
+    data: PhantomData<U>,
+}
 
-    fn serialize<W: AsyncWrite>(&mut self, writer: &mut W, item: U) -> Self::Serialize {
-        ByteSerializer::serialize(&mut self.0, writer, item)
+impl<
+        U: Unpin + Serialize + DeserializeOwned,
+        T: Unpin + Serializer<U>,
+        S: Unpin + Sink<T::Representation> + TryStream<Ok = T::Representation>,
+    > Stream for SerdeOutput<U, T, S>
+{
+    type Item = Result<U, ItemError<T::DeserializeError, <S as TryStream>::Error>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let item = ready!(Pin::new(&mut this.channel).poll_next(cx));
+        if let Some(item) = item {
+            let item = item.map_err(ItemError::Stream)?;
+            Poll::Ready(Some(
+                this.serializer.deserialize(item).map_err(ItemError::Serde),
+            ))
+        } else {
+            return Poll::Ready(None);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ItemError<T, E> {
+    Serde(T),
+    Stream(E),
+}
+
+impl<
+        U: Unpin + Serialize + DeserializeOwned,
+        T: Unpin + Serializer<U>,
+        S: Unpin + Sink<T::Representation> + TryStream<Ok = T::Representation>,
+    > Sink<U> for SerdeOutput<U, T, S>
+{
+    type Error = ItemError<T::SerializeError, <S as Sink<T::Representation>>::Error>;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.channel)
+            .poll_ready(cx)
+            .map_err(ItemError::Stream)
     }
 
-    fn deserialize<R: AsyncRead>(&mut self, reader: &mut R) -> Self::Deserialize {
-        ByteSerializer::deserialize(&mut self.0, reader)
+    fn start_send(mut self: Pin<&mut Self>, item: U) -> Result<(), Self::Error> {
+        let this = &mut *self;
+        let serialized = this.serializer.serialize(item).map_err(ItemError::Serde)?;
+        Pin::new(&mut this.channel)
+            .start_send(serialized)
+            .map_err(ItemError::Stream)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.channel)
+            .poll_flush(cx)
+            .map_err(ItemError::Stream)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.channel)
+            .poll_close(cx)
+            .map_err(ItemError::Stream)
+    }
+}
+
+impl<T: Serializer<U>, U: Serialize + DeserializeOwned> Format<U> for Serde<T> {}
+
+impl<
+        T: Unpin + Serializer<U>,
+        U: Unpin + Serialize + DeserializeOwned,
+        S: Unpin + Sink<T::Representation> + TryStream<Ok = T::Representation>,
+    > ItemFormat<U, S> for Serde<T>
+{
+    type Representation = T::Representation;
+    type Output = SerdeOutput<U, T, S>;
+
+    fn wire(self, channel: S) -> Self::Output {
+        SerdeOutput {
+            serializer: self.0,
+            channel: channel.into_stream(),
+            data: PhantomData,
+        }
     }
 }
 
@@ -125,26 +173,38 @@ macro_rules! flat {
             impl<T, C: Channels<$x, Bottom>> Protocol<Serde<T>, C> for $x
             where
                 C::Unravel: Unpin,
-                C::Coalesce: Unpin
+                C::Coalesce: Unpin,
             {
                 type Unravel = $x;
                 type UnravelError = <C::Unravel as Sink<$x>>::Error;
                 type UnravelFuture =
                     Forward<Once<Ready<Result<$x, <C::Unravel as Sink<$x>>::Error>>>, C::Unravel>;
                 type Coalesce = Bottom;
-                type CoalesceError = Insufficient;
-                type CoalesceFuture =
-                    Map<StreamFuture<C::Coalesce>, fn((Option<$x>, C::Coalesce)) -> Result<$x, Insufficient>>;
+                type CoalesceError = SerdeError<<C::Coalesce as TryStream>::Error>;
+                type CoalesceFuture = Map<
+                    StreamFuture<IntoStream<C::Coalesce>>,
+                    fn(
+                        (
+                            Option<Result<<C::Coalesce as TryStream>::Ok, <C::Coalesce as TryStream>::Error>>,
+                            IntoStream<C::Coalesce>,
+                        ),
+                    ) -> Result<$x, SerdeError<<C::Coalesce as TryStream>::Error>>,
+                >;
 
                 fn unravel(self, channel: C::Unravel) -> Self::UnravelFuture {
                     once(ready(Ok(self))).forward(channel)
                 }
 
                 fn coalesce(channel: C::Coalesce) -> Self::CoalesceFuture {
-                    fn map<St>(next: (Option<$x>, St)) -> Result<$x, Insufficient> {
-                        next.0.ok_or(Insufficient)
+                    fn map<St, U>(next: (Option<Result<$x, U>>, St)) -> Result<$x, SerdeError<U>> {
+                        next.0
+                            .ok_or(SerdeError::Insufficient)?
+                            .map_err(SerdeError::Stream)
                     }
-                    channel.into_future().map(map::<C::Coalesce>)
+                    channel
+                        .into_stream()
+                        .into_future()
+                        .map(map::<IntoStream<C::Coalesce>, <C::Coalesce as TryStream>::Error>)
                 }
             }
         )*
