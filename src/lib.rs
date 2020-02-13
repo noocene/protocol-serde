@@ -24,12 +24,14 @@ use futures::{
     FutureExt, Sink, Stream, StreamExt, TryStream, TryStreamExt,
 };
 use protocol::{format::ItemFormat, Bottom, Channels, Format, Protocol};
+#[doc(hidden)]
+pub use serde;
 use serde::{de::DeserializeOwned, Serialize};
 
 #[macro_export]
 macro_rules! Serde {
     ($item:item) => {
-        #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #[derive($crate::serde::Serialize, $crate::serde::Deserialize)]
         $item
     };
 }
